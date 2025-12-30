@@ -1,0 +1,378 @@
+#!/usr/bin/env bash
+#
+# kitty-ai-subagent: Spawn parallel AI agent workers from Kitty terminal
+#
+# Similar to tmux-subagent but for Kitty terminal emulator.
+#
+# Usage:
+#   kitty-ai-subagent spawn --agent AGENT --task "TASK"
+#   kitty-ai-subagent prompt-spawn AGENT
+#
+# Environment:
+#   KITTY_SUBAGENT_CONTEXT_LINES          Max lines captured (default: 1000)
+#   KITTY_SUBAGENT_SUMMARIZE_MIN_LINES    Summarize if context exceeds this (default: 500)
+#   KITTY_SUBAGENT_SUMMARIZATION_TOOL     Tool for summarization: claude or gemini (default: claude)
+#   KITTY_SUBAGENT_SUMMARIZATION_MODEL    Model for claude summarization (default: sonnet)
+#   KITTY_SUBAGENT_STARTUP_DELAY_SECS     Delay before injecting prompt (default: 2)
+#   KITTY_SUBAGENT_INJECT_WAIT_SECS       Max seconds to wait for agent prompt (default: 30)
+#   KITTY_SUBAGENT_INJECT_POLL_SECS       Poll interval while waiting (default: 0.5)
+#
+# Requirements:
+#   - Kitty with remote control enabled (allow_remote_control yes)
+#   - Either run kitty with --listen-on or set listen_on in kitty.conf
+#
+
+set -euo pipefail
+
+# Colors
+_c_gray=$'\033[90m'
+_c_green=$'\033[32m'
+_c_yellow=$'\033[33m'
+_c_reset=$'\033[0m'
+
+msg() {
+    echo "${_c_gray}[kitty-ai-subagent]${_c_reset} $*"
+}
+
+msg_ok() {
+    echo "${_c_green}[kitty-ai-subagent]${_c_reset} $*"
+}
+
+msg_warn() {
+    echo "${_c_yellow}[kitty-ai-subagent]${_c_reset} $*"
+}
+
+die() {
+    echo "kitty-ai-subagent: $*" >&2
+    exit 1
+}
+
+# Defaults
+readonly DEFAULT_CONTEXT_LINES=1000
+readonly DEFAULT_SUMMARIZE_MIN_LINES=500
+readonly DEFAULT_SUMMARIZATION_TOOL=claude
+readonly DEFAULT_SUMMARIZATION_MODEL=sonnet
+readonly DEFAULT_STARTUP_DELAY_SECS=2
+readonly DEFAULT_INJECT_WAIT_SECS=30
+readonly DEFAULT_INJECT_POLL_SECS=0.5
+
+readonly DEFAULT_SUMMARY_PROMPT=$'Write a concise markdown summary of the transcript, prioritizing information necessary to complete the task and excluding unrelated discussion.\n\nOutput format (use these headings in this order):\n1. Task — reproduce the task text verbatim.\n2. Current State — 3–7 bullets describing what is true now (key files/branches/config/state).\n3. Key Context (Task-Relevant) — up to 8 bullets; include only facts that change how the task should be done.\n4. Decisions / Constraints — up to 6 bullets (safety constraints, chosen options).\n5. Commands / Paths / Identifiers — exact literals (paths, commands, flags, env vars, branch/commit ids, relevant ids).\n6. Open Questions / Risks — up to 5 bullets; if missing, write `Unknown`.\n\nHard rules:\n- Output markdown to stdout only (no files).\n- Do not invent details; if not present, write `Unknown`.\n- Preserve exact file paths, command lines, flags, and error messages when present.\n- Prefer short bullets.\n'
+
+check_kitty_remote() {
+    if ! command -v kitten &>/dev/null; then
+        die "kitten command not found. Is Kitty installed?"
+    fi
+
+    if ! kitten @ ls &>/dev/null; then
+        die "Cannot connect to Kitty. Make sure:
+  1. allow_remote_control is enabled in kitty.conf
+  2. Kitty is running with --listen-on or listen_on is set
+
+Add to kitty.conf:
+  allow_remote_control yes
+  listen_on unix:/tmp/kitty-\$KITTY_PID"
+    fi
+}
+
+get_current_window_id() {
+    kitten @ ls 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for os_window in data:
+    if os_window.get('is_focused'):
+        for tab in os_window.get('tabs', []):
+            if tab.get('is_focused'):
+                for window in tab.get('windows', []):
+                    if window.get('is_focused'):
+                        print(window.get('id'))
+                        sys.exit(0)
+" 2>/dev/null || echo ""
+}
+
+capture_context() {
+    local window_id="$1"
+    local max_lines="$2"
+
+    # Capture scrollback + screen content
+    local content
+    if [[ -n "$window_id" ]]; then
+        content=$(kitten @ get-text --match "id:$window_id" --extent all --ansi 2>/dev/null || true)
+    else
+        content=$(kitten @ get-text --extent all --ansi 2>/dev/null || true)
+    fi
+
+    # Strip ANSI codes and get last N lines
+    printf '%s' "$content" | sed 's/\x1b\[[0-9;]*m//g' | tail -n "$max_lines"
+}
+
+summarize_context() {
+    local task="$1"
+    local raw_context="$2"
+    local tool="$3"
+    local model="$4"
+    local summary_prompt="$5"
+
+    case "$tool" in
+        claude)
+            printf '<task>\n%s\n</task>\n\n<transcript>\n%s\n</transcript>\n' "$task" "$raw_context" \
+                | claude -p --model "$model" "$summary_prompt" 2>/dev/null || echo ""
+            ;;
+        gemini)
+            printf '<task>\n%s\n</task>\n\n<transcript>\n%s\n</transcript>\n' "$task" "$raw_context" \
+                | gemini -p "$summary_prompt" 2>/dev/null || echo ""
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
+wait_for_prompt() {
+    local window_id="$1"
+    local max_wait="$2"
+    local poll_interval="$3"
+
+    local prompt_re='(^>($|[[:space:]]))|(^›($|[[:space:]]))|(^❯($|[[:space:]]))'
+    local end_at=$((SECONDS + max_wait))
+
+    while [[ $SECONDS -lt $end_at ]]; do
+        local pane_content last_line
+        pane_content=$(kitten @ get-text --match "id:$window_id" --extent screen 2>/dev/null || true)
+        last_line=$(printf '%s\n' "$pane_content" \
+            | sed 's/\x1b\[[0-9;]*m//g' \
+            | sed '/^[[:space:]]*$/d' \
+            | tail -n 1)
+
+        if printf '%s\n' "$last_line" | grep -Eq "$prompt_re"; then
+            return 0
+        fi
+
+        sleep "$poll_interval"
+    done
+
+    return 1
+}
+
+cmd_spawn() {
+    local agent="" task="" cwd=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --agent) agent="$2"; shift 2 ;;
+            --task) task="$2"; shift 2 ;;
+            --cwd) cwd="$2"; shift 2 ;;
+            *) die "spawn: unknown argument: $1" ;;
+        esac
+    done
+
+    [[ -n "$agent" ]] || die "spawn: --agent required"
+    [[ -n "$task" ]] || die "spawn: --task required"
+    [[ -z "$cwd" ]] && cwd="$(pwd)"
+
+    check_kitty_remote
+
+    # Get config from environment
+    local context_lines="${KITTY_SUBAGENT_CONTEXT_LINES:-$DEFAULT_CONTEXT_LINES}"
+    local summarize_min="${KITTY_SUBAGENT_SUMMARIZE_MIN_LINES:-$DEFAULT_SUMMARIZE_MIN_LINES}"
+    local summarization_tool="${KITTY_SUBAGENT_SUMMARIZATION_TOOL:-$DEFAULT_SUMMARIZATION_TOOL}"
+    local summarization_model="${KITTY_SUBAGENT_SUMMARIZATION_MODEL:-$DEFAULT_SUMMARIZATION_MODEL}"
+    local startup_delay="${KITTY_SUBAGENT_STARTUP_DELAY_SECS:-$DEFAULT_STARTUP_DELAY_SECS}"
+    local inject_wait="${KITTY_SUBAGENT_INJECT_WAIT_SECS:-$DEFAULT_INJECT_WAIT_SECS}"
+    local inject_poll="${KITTY_SUBAGENT_INJECT_POLL_SECS:-$DEFAULT_INJECT_POLL_SECS}"
+    local summary_prompt="${KITTY_SUBAGENT_SUMMARY_PROMPT:-$DEFAULT_SUMMARY_PROMPT}"
+
+    # Get current window for context capture
+    local source_window_id
+    source_window_id=$(get_current_window_id)
+
+    # Capture context
+    msg "Capturing context (up to $context_lines lines)..."
+    local raw_context line_count
+    raw_context=$(capture_context "$source_window_id" "$context_lines")
+    line_count=$(printf '%s' "$raw_context" | wc -l | tr -d ' ')
+    msg "Captured $line_count lines"
+
+    # Summarize if needed
+    local context="$raw_context"
+    if [[ "$line_count" -gt "$summarize_min" ]]; then
+        if command -v "$summarization_tool" &>/dev/null; then
+            msg "Summarizing with $summarization_tool ($line_count > $summarize_min)..."
+            local summary
+            summary=$(summarize_context "$task" "$raw_context" "$summarization_tool" "$summarization_model" "$summary_prompt")
+            if [[ -n "$summary" ]]; then
+                context="$summary"
+                msg_ok "Summarization complete"
+            else
+                msg_warn "Summarization failed, using raw context"
+            fi
+        else
+            msg_warn "$summarization_tool not found, using raw context"
+        fi
+    fi
+
+    # Build prompt payload
+    local prompt_payload
+    prompt_payload=$(printf '<context>\n%s\n</context>\n\n<task>\n%s\n\nConstraints:\n- Do not create or modify files unless the task explicitly asks you to.\n- Respond in this chat/session output (no writing to disk).\n</task>\n' "$context" "$task")
+
+    # Create new tab with the agent
+    local ts window_title
+    ts=$(date +%H%M%S)
+    window_title="subagent:${agent}:${ts}"
+
+    msg "Launching $agent in new tab..."
+    local new_window_id
+
+    # Launch new tab with login shell to load PATH from .zshrc/.bashrc
+    new_window_id=$(kitten @ launch --type=tab --tab-title "$window_title" --cwd "$cwd" --hold -- zsh -ilc "$agent" 2>&1)
+
+    # If return is not a number, it might be an error
+    if [[ ! "$new_window_id" =~ ^[0-9]+$ ]]; then
+        msg_warn "Launch output: $new_window_id"
+        # Try to get the ID of the newly created window
+        sleep 0.5
+        new_window_id=$(kitten @ ls 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for os_window in data:
+    for tab in os_window.get('tabs', []):
+        if 'subagent:' in tab.get('title', ''):
+            for window in tab.get('windows', []):
+                print(window.get('id'))
+                sys.exit(0)
+" 2>/dev/null || echo "")
+    fi
+
+    if [[ -z "$new_window_id" ]]; then
+        die "Failed to create new tab"
+    fi
+
+    msg "New window ID: $new_window_id"
+    msg "Waiting ${startup_delay}s for agent to start..."
+    sleep "$startup_delay"
+
+    # Inject prompt directly (without trying to detect the agent prompt)
+    msg "Injecting task..."
+    kitten @ send-text --match "id:$new_window_id" -- "$prompt_payload"
+    sleep 0.5
+    kitten @ send-text --match "id:$new_window_id" $'\n'
+    msg_ok "Task injected!"
+
+    echo ""
+    msg_ok "Subagent running in tab: $window_title"
+}
+
+cmd_prompt_spawn() {
+    local agent="${1:-}"
+    [[ -n "$agent" ]] || die "prompt-spawn: agent required"
+
+    check_kitty_remote
+
+    echo -n "Task: "
+    read -r task
+
+    [[ -n "$task" ]] || die "No task provided"
+
+    cmd_spawn --agent "$agent" --task "$task"
+}
+
+cmd_quick() {
+    # Quick spawn without context capture (for simple tasks)
+    local agent="${1:-}"
+    local task="${2:-}"
+
+    [[ -n "$agent" ]] || die "quick: agent required"
+    [[ -n "$task" ]] || die "quick: task required"
+
+    check_kitty_remote
+
+    local ts window_title
+    ts=$(date +%H%M%S)
+    window_title="subagent:${agent}:${ts}"
+
+    msg "Launching $agent..."
+    local new_window_id
+    new_window_id=$(kitten @ launch --type=tab --tab-title "$window_title" --cwd "$(pwd)" -- zsh -ilc "$agent" 2>/dev/null)
+
+    sleep 2
+
+    kitten @ send-text --match "id:$new_window_id" "$task"
+    sleep 0.3
+    kitten @ send-text --match "id:$new_window_id" $'\n'
+
+    msg_ok "Subagent running in tab: $window_title"
+}
+
+cmd_list() {
+    check_kitty_remote
+
+    echo "Active subagent tabs:"
+    kitten @ ls 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for os_window in data:
+    for tab in os_window.get('tabs', []):
+        title = tab.get('title', '')
+        if 'subagent:' in title:
+            tab_id = tab.get('id')
+            print(f'  - {title} (tab_id: {tab_id})')
+" 2>/dev/null || echo "  (none)"
+}
+
+cmd_help() {
+    cat <<'EOF'
+kitty-ai-subagent: Spawn parallel AI agent workers from Kitty terminal
+
+Commands:
+  spawn --agent AGENT --task "TASK" [--cwd DIR]
+      Capture context and spawn agent in new tab with the task
+
+  prompt-spawn AGENT
+      Prompt for task interactively, then spawn
+
+  quick AGENT "TASK"
+      Quick spawn without context capture
+
+  list
+      List active subagent tabs
+
+  help
+      Show this help
+
+Examples:
+  kitty-ai-subagent spawn --agent claude --task "Review this code for bugs"
+  kitty-ai-subagent prompt-spawn claude
+  kitty-ai-subagent quick gemini "What is 2+2?"
+
+Environment Variables:
+  KITTY_SUBAGENT_CONTEXT_LINES          Max lines captured (default: 1000)
+  KITTY_SUBAGENT_SUMMARIZE_MIN_LINES    Summarize threshold (default: 500)
+  KITTY_SUBAGENT_SUMMARIZATION_TOOL     claude or gemini (default: claude)
+  KITTY_SUBAGENT_SUMMARIZATION_MODEL    Model for summarization (default: sonnet)
+  KITTY_SUBAGENT_STARTUP_DELAY_SECS     Startup delay (default: 2)
+  KITTY_SUBAGENT_INJECT_WAIT_SECS       Max wait for prompt (default: 30)
+
+Setup:
+  Add to ~/.config/kitty/kitty.conf:
+    allow_remote_control yes
+    listen_on unix:/tmp/kitty-$KITTY_PID
+
+  Or start Kitty with:
+    kitty --listen-on unix:/tmp/kitty
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        spawn) cmd_spawn "$@" ;;
+        prompt-spawn) cmd_prompt_spawn "$@" ;;
+        quick) cmd_quick "$@" ;;
+        list) cmd_list ;;
+        help|-h|--help) cmd_help ;;
+        *) die "unknown command: $cmd (try: help)" ;;
+    esac
+}
+
+main "$@"
