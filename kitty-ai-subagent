@@ -52,7 +52,7 @@ readonly DEFAULT_CONTEXT_LINES=1000
 readonly DEFAULT_SUMMARIZE_MIN_LINES=500
 readonly DEFAULT_SUMMARIZATION_TOOL=claude
 readonly DEFAULT_SUMMARIZATION_MODEL=sonnet
-readonly DEFAULT_STARTUP_DELAY_SECS=2
+readonly DEFAULT_STARTUP_DELAY_SECS=5
 readonly DEFAULT_INJECT_WAIT_SECS=30
 readonly DEFAULT_INJECT_POLL_SECS=0.5
 
@@ -254,7 +254,8 @@ for os_window in data:
     msg "Injecting task..."
     kitten @ send-text --match "id:$new_window_id" -- "$prompt_payload"
     sleep 0.5
-    kitten @ send-text --match "id:$new_window_id" $'\n'
+    # Send Enter key
+    kitten @ send-key --match "id:$new_window_id" enter
     msg_ok "Task injected!"
 
     echo ""
@@ -297,7 +298,7 @@ cmd_quick() {
 
     kitten @ send-text --match "id:$new_window_id" "$task"
     sleep 0.3
-    kitten @ send-text --match "id:$new_window_id" $'\n'
+    kitten @ send-key --match "id:$new_window_id" enter
 
     msg_ok "Subagent running in tab: $window_title"
 }
