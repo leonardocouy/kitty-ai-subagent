@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 #
-# Install kitty-ai-subagent
+# Install/Update kitty-ai-subagent
 #
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${HOME}/.local/bin"
+
+# If in a git repo, pull latest changes
+if [[ -d "$SCRIPT_DIR/.git" ]]; then
+    echo "Updating from git..."
+    git -C "$SCRIPT_DIR" pull --ff-only || true
+fi
 
 echo "Installing kitty-ai-subagent..."
 
