@@ -4,6 +4,33 @@ Spawn parallel AI agent workers from [Kitty terminal](https://sw.kovidgoyal.net/
 
 Delegate subtasks to Claude, Codex, Gemini or any CLI-based AI agent without losing context from your current session.
 
+## Example Workflow
+
+You're building a user authentication system with Claude and need to parallelize the work:
+
+```
+# Tab 1: Working with Claude on the authentication system
+> Help me implement user authentication with JWT
+
+Claude: I'll help you build the auth system. Let's start with the login endpoint...
+[You work together on the main auth flow]
+
+# While Claude works on the login endpoint, you need someone to write the tests
+# Spawn a subagent - it receives your full conversation context:
+
+$ kitty-ai-subagent spawn --agent claude --task "Write unit tests for the auth functions we're building"
+
+# Tab 2 opens: Claude has all the context about what you're building
+# and starts writing tests in parallel
+
+# You can even spawn another one:
+$ kitty-ai-subagent spawn --agent claude --task "Write the README documentation for the auth module"
+
+# Tab 3 opens: Another Claude writes docs while you keep coding
+```
+
+**Result:** Three Claude sessions working on the same feature - you focus on the core implementation while subagents handle tests and docs in parallel, all with shared context.
+
 ## Features
 
 - **Context capture** - Automatically captures scrollback from your current terminal
@@ -81,33 +108,6 @@ kitty-ai-subagent quick gemini "What is the capital of France?"
 ```bash
 kitty-ai-subagent list
 ```
-
-## Example Workflow
-
-You're building a user authentication system with Claude and need to parallelize the work:
-
-```
-# Tab 1: Working with Claude on the authentication system
-> Help me implement user authentication with JWT
-
-Claude: I'll help you build the auth system. Let's start with the login endpoint...
-[You work together on the main auth flow]
-
-# While Claude works on the login endpoint, you need someone to write the tests
-# Spawn a subagent - it receives your full conversation context:
-
-$ kitty-ai-subagent spawn --agent claude --task "Write unit tests for the auth functions we're building"
-
-# Tab 2 opens: Claude has all the context about what you're building
-# and starts writing tests in parallel
-
-# You can even spawn another one:
-$ kitty-ai-subagent spawn --agent claude --task "Write the README documentation for the auth module"
-
-# Tab 3 opens: Another Claude writes docs while you keep coding
-```
-
-**Result:** Three Claude sessions working on the same feature - you focus on the core implementation while subagents handle tests and docs in parallel, all with shared context.
 
 ## How it works
 
